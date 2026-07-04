@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 
 
@@ -39,3 +40,13 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
+
+if sys.platform == "darwin":
+    app = BUNDLE(
+        exe,
+        name="Second Cut.app",
+        icon=None,
+        bundle_identifier=None,
+    )
+else:
+    app = exe

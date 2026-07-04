@@ -1,12 +1,15 @@
 # Second Cut
 
-Simple Windows app for shrinking media folders without manual cleanup steps.
+Simple desktop app for shrinking media folders without manual cleanup steps.
 
 ## What v1 does
 
 - Scans a user-selected folder and every nested subfolder.
+- Supports scan filters for images only, videos only, or both.
 - Supports JPEG images: `.jpg`, `.jpeg`, in any case variant.
 - Supports videos: `.mp4`, `.mov`, in any case variant.
+- Qualifies images for processing only when they exceed the configured size threshold.
+- Qualifies videos for processing only when their measured MB per 10 seconds exceeds the configured threshold.
 - Ignores anything already inside `.to-be-deleted`.
 - Replaces successful outputs in place so the visible files keep the real names.
 - Moves originals and rejected generated files into `.to-be-deleted` instead of deleting them.
@@ -14,17 +17,28 @@ Simple Windows app for shrinking media folders without manual cleanup steps.
 
 ## Requirements
 
-- Windows
 - Python 3.13+
 - `ffmpeg` on `PATH`
 - `ffprobe` on `PATH`
 - `exiftool` on `PATH`
+- Tkinter available in the local Python install
+
+Platform notes:
+- Windows is the primary tested target today.
+- macOS and Linux now have packaging support as well, but media tool installation and GUI behavior still need validation on those platforms.
 
 ## Run
 
 ```powershell
 python app.py
 ```
+
+Advanced settings are available from the `Advanced...` button in the app. They stay hidden from the main screen by default and let you change:
+
+- minimum image size threshold
+- minimum video MB-per-10-seconds threshold
+- video preset: `veryfast`, `fast`, `medium`, `slow`, `veryslow`
+- video quality, defaulting to `34`
 
 ## Packaging
 
@@ -34,10 +48,16 @@ Install PyInstaller once:
 python -m pip install pyinstaller
 ```
 
-Build the packaged app:
+Build the packaged app on Windows:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\packaging\build.ps1
+```
+
+Build the packaged app on macOS or Linux:
+
+```sh
+sh ./packaging/build.sh
 ```
 
 The build output is created under `dist\`.

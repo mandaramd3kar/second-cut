@@ -18,31 +18,34 @@ class ToolPaths:
     exiftool: str
 
 
-def discover_tools() -> ToolPaths:
+def discover_tools(
+    *,
+    require_ffmpeg: bool = True,
+    require_ffprobe: bool = True,
+    require_exiftool: bool = True,
+) -> ToolPaths:
     ffmpeg = shutil.which("ffmpeg")
     ffprobe = shutil.which("ffprobe")
     exiftool = shutil.which("exiftool")
     missing = [
         name
         for name, value in (
-            ("ffmpeg", ffmpeg),
-            ("ffprobe", ffprobe),
-            ("exiftool", exiftool),
+            ("ffmpeg", ffmpeg if require_ffmpeg else "ok"),
+            ("ffprobe", ffprobe if require_ffprobe else "ok"),
+            ("exiftool", exiftool if require_exiftool else "ok"),
         )
         if not value
     ]
     if missing:
-        raise MediaToolError(
-            "Missing required tools on PATH: " + ", ".join(missing)
-        )
-    return ToolPaths(ffmpeg=ffmpeg, ffprobe=ffprobe, exiftool=exiftool)
+        raise MediaToolError("Missing required tools on PATH: " + ", ".join(missing))
+    return ToolPaths(ffmpeg=ffmpeg or "", ffprobe=ffprobe or "", exiftool=exiftool or "")
 
 
 def file_size(path: Path) -> int:
     return path.stat().st_size
 
 
-def _run(command: list[str]) -> None:
+def _run_process(command: list[str]) -> subprocess.CompletedProcess[str]:
     creationflags = 0
     startupinfo = None
     if sys.platform == "win32":
@@ -51,7 +54,7 @@ def _run(command: list[str]) -> None:
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
 
-    completed = subprocess.run(
+    return subprocess.run(
         command,
         check=False,
         capture_output=True,
@@ -59,8 +62,24 @@ def _run(command: list[str]) -> None:
         creationflags=creationflags,
         startupinfo=startupinfo,
     )
+
+
+def _run(command: list[str]) -> None:
+    completed = _run_process(command)
     if completed.returncode == 0:
         return
+
+    stderr = (completed.stderr or "").strip()
+    stdout = (completed.stdout or "").strip()
+    detail = stderr or stdout or "Unknown ffmpeg/exiftool failure"
+    tail = "\n".join(detail.splitlines()[-10:])
+    raise MediaToolError(tail)
+
+
+def _run_capture(command: list[str]) -> str:
+    completed = _run_process(command)
+    if completed.returncode == 0:
+        return (completed.stdout or "").strip()
 
     stderr = (completed.stderr or "").strip()
     stdout = (completed.stdout or "").strip()
@@ -94,7 +113,29 @@ def transcode_image(source: Path, candidate: Path, tools: ToolPaths) -> None:
     )
 
 
-def transcode_video(source: Path, candidate: Path, tools: ToolPaths) -> str:
+def probe_video_duration(source: Path, tools: ToolPaths) -> float:
+    output = _run_capture(
+        [
+            tools.ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(source),
+        ]
+    )
+    try:
+        duration = float(output)
+    except ValueError as exc:
+        raise MediaToolError(f"Could not parse video duration for {source.name}.") from exc
+    if duration <= 0:
+        raise MediaToolError(f"Video duration was not positive for {source.name}.")
+    return duration
+
+
+def transcode_video(source: Path, candidate: Path, tools: ToolPaths, preset: str, quality: int) -> str:
     qsv_command = [
         tools.ffmpeg,
         "-y",
@@ -111,9 +152,9 @@ def transcode_video(source: Path, candidate: Path, tools: ToolPaths) -> str:
         "-c:v",
         "hevc_qsv",
         "-preset",
-        "veryfast",
+        preset,
         "-global_quality",
-        "34",
+        str(quality),
         "-c:a",
         "aac",
         "-b:a",
@@ -143,9 +184,9 @@ def transcode_video(source: Path, candidate: Path, tools: ToolPaths) -> str:
         "-c:v",
         "libx265",
         "-preset",
-        "medium",
+        preset,
         "-crf",
-        "30",
+        str(quality),
         "-c:a",
         "aac",
         "-b:a",

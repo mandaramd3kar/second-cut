@@ -6,7 +6,24 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
-from engine import DeleteResult, ProcessProgress, ProcessResult, ScanResult, delete_archive, process_root, scan_root
+from engine import (
+    DEFAULT_MIN_IMAGE_MEGABYTES,
+    DEFAULT_MIN_VIDEO_MEGABYTES_PER_10_SECONDS,
+    DEFAULT_VIDEO_PRESET,
+    DEFAULT_VIDEO_QUALITY,
+    MEDIA_MODE_BOTH,
+    MEDIA_MODE_IMAGES,
+    MEDIA_MODE_VIDEOS,
+    VIDEO_PRESET_OPTIONS,
+    AppSettings,
+    DeleteResult,
+    ProcessProgress,
+    ProcessResult,
+    ScanResult,
+    delete_archive,
+    process_root,
+    scan_root,
+)
 from media_tools import MediaToolError
 
 
@@ -19,6 +36,15 @@ class ShrinkMediaApp:
 
         self.selected_root = tk.StringVar()
         self.log_search_var = tk.StringVar()
+        self.media_mode_var = tk.StringVar(value=MEDIA_MODE_BOTH)
+        self.min_image_mb_var = tk.DoubleVar(value=DEFAULT_MIN_IMAGE_MEGABYTES)
+        self.min_video_mb_per_10s_var = tk.DoubleVar(value=DEFAULT_MIN_VIDEO_MEGABYTES_PER_10_SECONDS)
+        self.video_preset_index_var = tk.IntVar(value=VIDEO_PRESET_OPTIONS.index(DEFAULT_VIDEO_PRESET))
+        self.video_quality_var = tk.IntVar(value=DEFAULT_VIDEO_QUALITY)
+        self.image_threshold_label_var = tk.StringVar()
+        self.video_threshold_label_var = tk.StringVar()
+        self.video_preset_label_var = tk.StringVar()
+        self.video_quality_label_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Choose a folder, then scan or process it.")
         self.summary_vars = {
             "images": tk.StringVar(value="0"),
@@ -32,8 +58,10 @@ class ShrinkMediaApp:
 
         self.queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker_thread: threading.Thread | None = None
+        self.advanced_window: tk.Toplevel | None = None
         self._tree_sort_state: dict[str, bool] = {}
         self._log_search_index = "1.0"
+        self._refresh_advanced_labels()
         self._configure_style()
         self._build_ui()
         self.root.after(100, self._poll_queue)
@@ -69,6 +97,17 @@ class ShrinkMediaApp:
         self.delete_button = ttk.Button(button_row, text="Delete .to-be-deleted", command=self._start_delete)
         self.delete_button.pack(side=tk.LEFT)
 
+        ttk.Separator(button_row, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=12)
+        ttk.Label(button_row, text="Mode").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Radiobutton(button_row, text="Both", value=MEDIA_MODE_BOTH, variable=self.media_mode_var).pack(side=tk.LEFT)
+        ttk.Radiobutton(button_row, text="Images only", value=MEDIA_MODE_IMAGES, variable=self.media_mode_var).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        ttk.Radiobutton(button_row, text="Videos only", value=MEDIA_MODE_VIDEOS, variable=self.media_mode_var).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        ttk.Button(button_row, text="Advanced...", command=self._open_advanced_settings).pack(side=tk.RIGHT)
+
         summary = ttk.LabelFrame(frame, text="Summary", padding=12)
         summary.pack(fill=tk.X)
 
@@ -98,7 +137,7 @@ class ShrinkMediaApp:
             text="Scroll vertically or horizontally to inspect the full result list.",
         ).pack(anchor="w", pady=(0, 8))
 
-        columns = ("status", "action", "kind", "path", "detail")
+        columns = ("status", "action", "kind", "size", "rate", "path", "detail")
         tree_container = ttk.Frame(results_frame)
         tree_container.pack(fill=tk.BOTH, expand=True)
 
@@ -107,8 +146,10 @@ class ShrinkMediaApp:
             ("status", "Status", 110),
             ("action", "Action", 110),
             ("kind", "Type", 90),
-            ("path", "Path", 540),
-            ("detail", "Detail", 600),
+            ("size", "Size", 110),
+            ("rate", "MB/10s", 110),
+            ("path", "Path", 420),
+            ("detail", "Detail", 520),
         ):
             self.results_tree.heading(name, text=title, command=lambda column=name: self._sort_results_by(column))
             self.results_tree.column(name, width=width, anchor=tk.W)
@@ -156,7 +197,7 @@ class ShrinkMediaApp:
         self._clear_results()
         self._append_log(f"Scanning {folder}")
         self.status_var.set("Scanning folder tree...")
-        self._run_worker("scan", lambda: scan_root(folder))
+        self._run_worker("scan", lambda: scan_root(folder, self._build_settings()))
 
     def _start_process(self) -> None:
         folder = self._require_folder()
@@ -165,7 +206,10 @@ class ShrinkMediaApp:
         self._clear_results()
         self._append_log(f"Processing {folder}")
         self.status_var.set("Processing files in the background...")
-        self._run_worker("process", lambda: process_root(folder, log=self._queue_log, progress=self._queue_progress))
+        self._run_worker(
+            "process",
+            lambda: process_root(folder, self._build_settings(), log=self._queue_log, progress=self._queue_progress),
+        )
 
     def _start_delete(self) -> None:
         folder = self._require_folder()
@@ -241,8 +285,10 @@ class ShrinkMediaApp:
             self.summary_vars["images"].set(str(result.image_count))
             self.summary_vars["videos"].set(str(result.video_count))
             self.summary_vars["scanned"].set(str(len(result.work_items)))
-            self.status_var.set(f"Scan complete. Found {len(result.work_items)} supported file(s).")
-            self._append_log(f"Scan complete. Found {len(result.work_items)} supported file(s).")
+            self.status_var.set(
+                f"Scan complete. Qualified {len(result.work_items)} of {len(result.items)} supported file(s)."
+            )
+            self._append_log(f"Scan complete. Qualified {len(result.work_items)} of {len(result.items)} supported file(s).")
             self._populate_scan_results(result)
             return
 
@@ -269,16 +315,18 @@ class ShrinkMediaApp:
             return
 
     def _populate_scan_results(self, result: ScanResult) -> None:
-        for item in result.work_items:
+        for item in result.items:
             self.results_tree.insert(
                 "",
                 tk.END,
                 values=(
-                    "ready",
+                    "ready" if item.ready else "skipped",
                     "scan",
                     item.media_kind,
+                    self._format_size(item.size_bytes),
+                    self._format_rate(item.mb_per_10_seconds),
                     self._format_display_path(item.source_path),
-                    "Supported file found.",
+                    item.detail,
                 ),
             )
 
@@ -312,6 +360,8 @@ class ShrinkMediaApp:
                 item.status,
                 item.action,
                 item.media_kind,
+                self._format_size(item.size_bytes),
+                self._format_rate(item.mb_per_10_seconds),
                 self._format_display_path(item.source_path),
                 item.detail,
             ),
@@ -337,10 +387,138 @@ class ShrinkMediaApp:
         self._tree_sort_state[column] = not descending
 
     def _sort_value(self, value: str):
+        stripped = value.strip()
+        if stripped.endswith(" MB"):
+            stripped = stripped[:-3]
         try:
-            return (0, float(value))
+            return (0, float(stripped))
         except ValueError:
             return (1, value.lower())
+
+    def _build_settings(self) -> AppSettings:
+        return AppSettings(
+            media_mode=self.media_mode_var.get(),
+            min_image_megabytes=round(self.min_image_mb_var.get(), 1),
+            min_video_megabytes_per_10_seconds=round(self.min_video_mb_per_10s_var.get(), 1),
+            video_preset=VIDEO_PRESET_OPTIONS[self.video_preset_index_var.get()],
+            video_quality=int(self.video_quality_var.get()),
+        )
+
+    def _open_advanced_settings(self) -> None:
+        if self.advanced_window is not None and self.advanced_window.winfo_exists():
+            self.advanced_window.focus_set()
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Advanced Settings")
+        window.transient(self.root)
+        window.resizable(False, False)
+        window.protocol("WM_DELETE_WINDOW", self._close_advanced_settings)
+        self.advanced_window = window
+
+        frame = ttk.Frame(window, padding=16)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frame, text="Scan thresholds and video encoding").pack(anchor="w")
+        ttk.Label(
+            frame,
+            text="These settings affect which files qualify during scan and how videos are encoded during processing.",
+            wraplength=460,
+        ).pack(anchor="w", pady=(4, 12))
+
+        ttk.Label(frame, textvariable=self.image_threshold_label_var).pack(anchor="w")
+        tk.Scale(
+            frame,
+            from_=0.1,
+            to=20.0,
+            resolution=0.1,
+            orient=tk.HORIZONTAL,
+            length=460,
+            variable=self.min_image_mb_var,
+            command=self._on_advanced_scale_changed,
+        ).pack(anchor="w")
+
+        ttk.Label(frame, textvariable=self.video_threshold_label_var).pack(anchor="w", pady=(10, 0))
+        tk.Scale(
+            frame,
+            from_=0.1,
+            to=20.0,
+            resolution=0.1,
+            orient=tk.HORIZONTAL,
+            length=460,
+            variable=self.min_video_mb_per_10s_var,
+            command=self._on_advanced_scale_changed,
+        ).pack(anchor="w")
+
+        ttk.Label(frame, textvariable=self.video_preset_label_var).pack(anchor="w", pady=(10, 0))
+        tk.Scale(
+            frame,
+            from_=0,
+            to=len(VIDEO_PRESET_OPTIONS) - 1,
+            resolution=1,
+            orient=tk.HORIZONTAL,
+            showvalue=False,
+            length=460,
+            variable=self.video_preset_index_var,
+            command=self._on_advanced_scale_changed,
+        ).pack(anchor="w")
+
+        ttk.Label(frame, textvariable=self.video_quality_label_var).pack(anchor="w", pady=(10, 0))
+        tk.Scale(
+            frame,
+            from_=20,
+            to=40,
+            resolution=1,
+            orient=tk.HORIZONTAL,
+            length=460,
+            variable=self.video_quality_var,
+            command=self._on_advanced_scale_changed,
+        ).pack(anchor="w")
+
+        actions = ttk.Frame(frame)
+        actions.pack(fill=tk.X, pady=(14, 0))
+        ttk.Button(actions, text="Reset Defaults", command=self._reset_advanced_defaults).pack(side=tk.LEFT)
+        ttk.Button(actions, text="Close", command=self._close_advanced_settings).pack(side=tk.RIGHT)
+
+        self._refresh_advanced_labels()
+        window.grab_set()
+
+    def _close_advanced_settings(self) -> None:
+        if self.advanced_window is not None and self.advanced_window.winfo_exists():
+            self.advanced_window.destroy()
+        self.advanced_window = None
+
+    def _reset_advanced_defaults(self) -> None:
+        self.min_image_mb_var.set(DEFAULT_MIN_IMAGE_MEGABYTES)
+        self.min_video_mb_per_10s_var.set(DEFAULT_MIN_VIDEO_MEGABYTES_PER_10_SECONDS)
+        self.video_preset_index_var.set(VIDEO_PRESET_OPTIONS.index(DEFAULT_VIDEO_PRESET))
+        self.video_quality_var.set(DEFAULT_VIDEO_QUALITY)
+        self._refresh_advanced_labels()
+
+    def _on_advanced_scale_changed(self, _value: str) -> None:
+        self._refresh_advanced_labels()
+
+    def _refresh_advanced_labels(self) -> None:
+        self.image_threshold_label_var.set(
+            f"Minimum image size to qualify: {self.min_image_mb_var.get():.1f} MB"
+        )
+        self.video_threshold_label_var.set(
+            f"Minimum video density to qualify: {self.min_video_mb_per_10s_var.get():.1f} MB per 10 seconds"
+        )
+        self.video_preset_label_var.set(
+            f"Video preset: {VIDEO_PRESET_OPTIONS[self.video_preset_index_var.get()]}"
+        )
+        self.video_quality_label_var.set(f"Video quality: {int(self.video_quality_var.get())}")
+
+    def _format_size(self, size_bytes: int | None) -> str:
+        if size_bytes is None:
+            return ""
+        return f"{size_bytes / (1024 * 1024):.2f} MB"
+
+    def _format_rate(self, mb_per_10_seconds: float | None) -> str:
+        if mb_per_10_seconds is None:
+            return ""
+        return f"{mb_per_10_seconds:.2f}"
 
     def _on_log_search_changed(self, *_args) -> None:
         self._highlight_log_matches(self.log_search_var.get().strip())
