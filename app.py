@@ -45,6 +45,9 @@ class ShrinkMediaApp:
         self.video_threshold_label_var = tk.StringVar()
         self.video_preset_label_var = tk.StringVar()
         self.video_quality_label_var = tk.StringVar()
+        self.video_codec_path_label_var = tk.StringVar(
+            value="Video codec path: hevc_qsv first, libx265 fallback. Decoding is auto-selected by ffmpeg from the source media."
+        )
         self.status_var = tk.StringVar(value="Choose a folder, then scan or process it.")
         self.summary_vars = {
             "images": tk.StringVar(value="0"),
@@ -137,22 +140,26 @@ class ShrinkMediaApp:
             text="Scroll vertically or horizontally to inspect the full result list.",
         ).pack(anchor="w", pady=(0, 8))
 
-        columns = ("status", "action", "kind", "size", "rate", "path", "detail")
+        columns = ("status", "action", "kind", "size", "rate", "new_size", "new_rate", "resolution", "new_resolution", "path", "detail")
         tree_container = ttk.Frame(results_frame)
         tree_container.pack(fill=tk.BOTH, expand=True)
 
         self.results_tree = ttk.Treeview(tree_container, columns=columns, show="headings", height=16)
         for name, title, width in (
-            ("status", "Status", 110),
-            ("action", "Action", 110),
-            ("kind", "Type", 90),
-            ("size", "Size", 110),
-            ("rate", "MB/10s", 110),
-            ("path", "Path", 420),
-            ("detail", "Detail", 520),
+            ("status", "Status", 45),
+            ("action", "Action", 72),
+            ("kind", "Type", 60),
+            ("size", "Size", 90),
+            ("rate", "MB/10s", 100),
+            ("new_size", "New Size", 90),
+            ("new_rate", "New MB/10s", 100),
+            ("resolution", "Res", 95),
+            ("new_resolution", "New Res", 95),
+            ("path", "Path", 310),
+            ("detail", "Detail", 460),
         ):
-            self.results_tree.heading(name, text=title, command=lambda column=name: self._sort_results_by(column))
-            self.results_tree.column(name, width=width, anchor=tk.W)
+            self.results_tree.heading(name, text=title, anchor=tk.W, command=lambda column=name: self._sort_results_by(column))
+            self.results_tree.column(name, width=width, minwidth=width, anchor=tk.W, stretch=name in {"path", "detail"})
 
         tree_scroll_y = ttk.Scrollbar(tree_container, orient=tk.VERTICAL, command=self.results_tree.yview)
         tree_scroll_x = ttk.Scrollbar(tree_container, orient=tk.HORIZONTAL, command=self.results_tree.xview)
@@ -325,6 +332,10 @@ class ShrinkMediaApp:
                     item.media_kind,
                     self._format_size(item.size_bytes),
                     self._format_rate(item.mb_per_10_seconds),
+                    "",
+                    "",
+                    self._format_resolution(item.resolution),
+                    "",
                     self._format_display_path(item.source_path),
                     item.detail,
                 ),
@@ -362,6 +373,10 @@ class ShrinkMediaApp:
                 item.media_kind,
                 self._format_size(item.size_bytes),
                 self._format_rate(item.mb_per_10_seconds),
+                self._format_size(item.reduced_size_bytes),
+                self._format_rate(item.reduced_mb_per_10_seconds),
+                self._format_resolution(item.resolution),
+                self._format_resolution(item.reduced_resolution),
                 self._format_display_path(item.source_path),
                 item.detail,
             ),
@@ -475,12 +490,20 @@ class ShrinkMediaApp:
             command=self._on_advanced_scale_changed,
         ).pack(anchor="w")
 
+        ttk.Label(
+            frame,
+            textvariable=self.video_codec_path_label_var,
+            wraplength=460,
+            justify=tk.LEFT,
+        ).pack(anchor="w", pady=(12, 0))
+
         actions = ttk.Frame(frame)
         actions.pack(fill=tk.X, pady=(14, 0))
         ttk.Button(actions, text="Reset Defaults", command=self._reset_advanced_defaults).pack(side=tk.LEFT)
         ttk.Button(actions, text="Close", command=self._close_advanced_settings).pack(side=tk.RIGHT)
 
         self._refresh_advanced_labels()
+        self._center_window(window, width=520, height=420)
         window.grab_set()
 
     def _close_advanced_settings(self) -> None:
@@ -519,6 +542,21 @@ class ShrinkMediaApp:
         if mb_per_10_seconds is None:
             return ""
         return f"{mb_per_10_seconds:.2f}"
+
+    def _format_resolution(self, resolution: tuple[int, int] | None) -> str:
+        if resolution is None:
+            return ""
+        return f"{resolution[0]} x {resolution[1]}"
+
+    def _center_window(self, window: tk.Toplevel, width: int, height: int) -> None:
+        self.root.update_idletasks()
+        root_x = self.root.winfo_rootx()
+        root_y = self.root.winfo_rooty()
+        root_width = self.root.winfo_width()
+        root_height = self.root.winfo_height()
+        x = root_x + max((root_width - width) // 2, 0)
+        y = root_y + max((root_height - height) // 2, 0)
+        window.geometry(f"{width}x{height}+{x}+{y}")
 
     def _on_log_search_changed(self, *_args) -> None:
         self._highlight_log_matches(self.log_search_var.get().strip())

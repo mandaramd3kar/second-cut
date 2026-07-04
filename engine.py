@@ -12,6 +12,7 @@ from media_tools import (
     ToolPaths,
     discover_tools,
     file_size,
+    probe_media_resolution,
     probe_video_duration,
     transcode_image,
     transcode_video,
@@ -45,6 +46,7 @@ class ScanItem:
     source_path: Path
     media_kind: str
     size_bytes: int
+    resolution: tuple[int, int] | None = None
     duration_seconds: float | None = None
     mb_per_10_seconds: float | None = None
     ready: bool = True
@@ -69,7 +71,11 @@ class FileResult:
     detail: str
     archive_count: int = 0
     size_bytes: int | None = None
+    resolution: tuple[int, int] | None = None
     mb_per_10_seconds: float | None = None
+    reduced_size_bytes: int | None = None
+    reduced_resolution: tuple[int, int] | None = None
+    reduced_mb_per_10_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -119,7 +125,7 @@ class DeleteResult:
 def scan_root(root_path: str | Path, settings: AppSettings | None = None) -> ScanResult:
     root = _validate_root(root_path)
     config = _normalize_settings(settings)
-    tools = discover_tools(require_ffmpeg=False, require_ffprobe=_mode_includes_video(config.media_mode), require_exiftool=False)
+    tools = discover_tools(require_ffmpeg=False, require_ffprobe=True, require_exiftool=False)
     items: list[ScanItem] = []
     image_count = 0
     video_count = 0
@@ -141,7 +147,7 @@ def scan_root(root_path: str | Path, settings: AppSettings | None = None) -> Sca
                 continue
 
             if media_kind == "image":
-                item = _scan_image(path, config)
+                item = _scan_image(path, config, tools)
             else:
                 item = _scan_video(path, config, tools)
 
@@ -175,7 +181,7 @@ def process_root(
     config = _normalize_settings(settings)
     tools = discover_tools(
         require_ffmpeg=_mode_includes(config.media_mode, "image") or _mode_includes(config.media_mode, "video"),
-        require_ffprobe=_mode_includes_video(config.media_mode),
+        require_ffprobe=True,
         require_exiftool=_mode_includes(config.media_mode, "image"),
     )
 
@@ -239,7 +245,11 @@ def process_root(
                     detail="Already resolved from a legacy in-progress file.",
                     archive_count=0,
                     size_bytes=item.size_bytes,
+                    resolution=item.resolution,
                     mb_per_10_seconds=item.mb_per_10_seconds,
+                    reduced_size_bytes=item.size_bytes,
+                    reduced_resolution=item.resolution,
+                    reduced_mb_per_10_seconds=item.mb_per_10_seconds,
                 )
             )
             skipped += 1
@@ -271,7 +281,9 @@ def process_root(
                 status="error",
                 detail=str(exc),
                 size_bytes=item.size_bytes,
+                resolution=item.resolution,
                 mb_per_10_seconds=item.mb_per_10_seconds,
+                reduced_resolution=item.resolution,
             )
 
         results.append(result)
@@ -382,8 +394,13 @@ def _is_legacy_video_candidate(path: Path) -> bool:
     return _parse_legacy_video_candidate(path) is not None
 
 
-def _scan_image(path: Path, settings: AppSettings) -> ScanItem:
+def _scan_image(path: Path, settings: AppSettings, tools: ToolPaths) -> ScanItem:
     size_bytes = file_size(path)
+    resolution = None
+    try:
+        resolution = probe_media_resolution(path, tools)
+    except MediaToolError:
+        pass
     size_megabytes = _bytes_to_megabytes(size_bytes)
     ready = size_megabytes > settings.min_image_megabytes
     if ready:
@@ -394,6 +411,7 @@ def _scan_image(path: Path, settings: AppSettings) -> ScanItem:
         source_path=path,
         media_kind="image",
         size_bytes=size_bytes,
+        resolution=resolution,
         ready=ready,
         detail=detail,
     )
@@ -401,6 +419,11 @@ def _scan_image(path: Path, settings: AppSettings) -> ScanItem:
 
 def _scan_video(path: Path, settings: AppSettings, tools: ToolPaths) -> ScanItem:
     size_bytes = file_size(path)
+    resolution = None
+    try:
+        resolution = probe_media_resolution(path, tools)
+    except MediaToolError:
+        pass
     try:
         duration_seconds = probe_video_duration(path, tools)
     except MediaToolError as exc:
@@ -408,6 +431,7 @@ def _scan_video(path: Path, settings: AppSettings, tools: ToolPaths) -> ScanItem
             source_path=path,
             media_kind="video",
             size_bytes=size_bytes,
+            resolution=resolution,
             ready=False,
             detail=f"Could not read video duration: {exc}",
         )
@@ -423,6 +447,7 @@ def _scan_video(path: Path, settings: AppSettings, tools: ToolPaths) -> ScanItem
         source_path=path,
         media_kind="video",
         size_bytes=size_bytes,
+        resolution=resolution,
         duration_seconds=duration_seconds,
         mb_per_10_seconds=mb_per_10_seconds,
         ready=ready,
@@ -663,7 +688,11 @@ def _process_item(root: Path, item: ScanItem, tools: ToolPaths, settings: AppSet
             detail="File no longer exists after legacy cleanup.",
             archive_count=0,
             size_bytes=item.size_bytes,
+            resolution=item.resolution,
             mb_per_10_seconds=item.mb_per_10_seconds,
+            reduced_size_bytes=item.size_bytes,
+            reduced_resolution=item.resolution,
+            reduced_mb_per_10_seconds=item.mb_per_10_seconds,
         )
 
     with tempfile.TemporaryDirectory(prefix="second-cut-") as temp_dir:
@@ -683,7 +712,11 @@ def _process_item(root: Path, item: ScanItem, tools: ToolPaths, settings: AppSet
                     detail=f"Image transcode failed: {exc}",
                     archive_count=0,
                     size_bytes=item.size_bytes,
+                    resolution=item.resolution,
                     mb_per_10_seconds=item.mb_per_10_seconds,
+                    reduced_size_bytes=item.size_bytes,
+                    reduced_resolution=item.resolution,
+                    reduced_mb_per_10_seconds=item.mb_per_10_seconds,
                 )
             return _finalize_image(root, item, candidate_path, log)
 
@@ -707,7 +740,11 @@ def _process_item(root: Path, item: ScanItem, tools: ToolPaths, settings: AppSet
                 detail=f"Video transcode failed: {exc}",
                 archive_count=0,
                 size_bytes=item.size_bytes,
+                resolution=item.resolution,
                 mb_per_10_seconds=item.mb_per_10_seconds,
+                reduced_size_bytes=item.size_bytes,
+                reduced_resolution=item.resolution,
+                reduced_mb_per_10_seconds=item.mb_per_10_seconds,
             )
         return _finalize_video(root, item, candidate_path, encoder, log)
 
@@ -715,6 +752,11 @@ def _process_item(root: Path, item: ScanItem, tools: ToolPaths, settings: AppSet
 def _finalize_image(root: Path, item: ScanItem, candidate_path: Path, log: LogFn) -> FileResult:
     source_path = item.source_path
     candidate_size = file_size(candidate_path)
+    reduced_resolution = item.resolution
+    try:
+        reduced_resolution = probe_media_resolution(candidate_path, discover_tools(require_ffmpeg=False, require_ffprobe=True, require_exiftool=False))
+    except MediaToolError:
+        pass
     source_size = file_size(source_path)
 
     if candidate_size >= source_size:
@@ -732,7 +774,11 @@ def _finalize_image(root: Path, item: ScanItem, candidate_path: Path, log: LogFn
             detail="Generated image was not smaller than the current file.",
             archive_count=1,
             size_bytes=item.size_bytes,
+            resolution=item.resolution,
             mb_per_10_seconds=item.mb_per_10_seconds,
+            reduced_size_bytes=candidate_size,
+            reduced_resolution=reduced_resolution,
+            reduced_mb_per_10_seconds=None,
         )
 
     archive_path = _archive_path(root, ORIGINALS_DIR_NAME, source_path.relative_to(root))
@@ -750,7 +796,11 @@ def _finalize_image(root: Path, item: ScanItem, candidate_path: Path, log: LogFn
         detail="Replaced image with a smaller version and archived the original.",
         archive_count=1,
         size_bytes=item.size_bytes,
+        resolution=item.resolution,
         mb_per_10_seconds=item.mb_per_10_seconds,
+        reduced_size_bytes=candidate_size,
+        reduced_resolution=reduced_resolution,
+        reduced_mb_per_10_seconds=None,
     )
 
 
@@ -763,6 +813,15 @@ def _finalize_video(
 ) -> FileResult:
     source_path = item.source_path
     final_path = source_path if source_path.suffix.lower() == ".mp4" else source_path.with_suffix(".mp4")
+    candidate_size = file_size(candidate_path)
+    reduced_resolution = item.resolution
+    try:
+        reduced_resolution = probe_media_resolution(candidate_path, discover_tools(require_ffmpeg=False, require_ffprobe=True, require_exiftool=False))
+    except MediaToolError:
+        pass
+    reduced_mb_per_10_seconds = None
+    if item.duration_seconds is not None:
+        reduced_mb_per_10_seconds = _megabytes_per_10_seconds(candidate_size, item.duration_seconds)
 
     if final_path != source_path and final_path.exists():
         rejected_path = _archive_path(root, REJECTED_DIR_NAME, final_path.relative_to(root))
@@ -779,10 +838,12 @@ def _finalize_video(
             detail="Could not replace MOV because the final .mp4 filename already existed.",
             archive_count=1,
             size_bytes=item.size_bytes,
+            resolution=item.resolution,
             mb_per_10_seconds=item.mb_per_10_seconds,
+            reduced_size_bytes=candidate_size,
+            reduced_resolution=reduced_resolution,
+            reduced_mb_per_10_seconds=reduced_mb_per_10_seconds,
         )
-
-    candidate_size = file_size(candidate_path)
     source_size = file_size(source_path)
 
     if candidate_size >= source_size:
@@ -800,7 +861,11 @@ def _finalize_video(
             detail=f"Generated video was not smaller than the current file ({encoder}).",
             archive_count=1,
             size_bytes=item.size_bytes,
+            resolution=item.resolution,
             mb_per_10_seconds=item.mb_per_10_seconds,
+            reduced_size_bytes=candidate_size,
+            reduced_resolution=reduced_resolution,
+            reduced_mb_per_10_seconds=reduced_mb_per_10_seconds,
         )
 
     archive_path = _archive_path(root, ORIGINALS_DIR_NAME, source_path.relative_to(root))
@@ -818,7 +883,11 @@ def _finalize_video(
         detail=f"Replaced video with a smaller MP4 and archived the original ({encoder}).",
         archive_count=1,
         size_bytes=item.size_bytes,
+        resolution=item.resolution,
         mb_per_10_seconds=item.mb_per_10_seconds,
+        reduced_size_bytes=candidate_size,
+        reduced_resolution=reduced_resolution,
+        reduced_mb_per_10_seconds=reduced_mb_per_10_seconds,
     )
 
 

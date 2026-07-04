@@ -135,6 +135,34 @@ def probe_video_duration(source: Path, tools: ToolPaths) -> float:
     return duration
 
 
+def probe_media_resolution(source: Path, tools: ToolPaths) -> tuple[int, int]:
+    output = _run_capture(
+        [
+            tools.ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0:s=x",
+            str(source),
+        ]
+    )
+    parts = output.split("x", 1)
+    if len(parts) != 2:
+        raise MediaToolError(f"Could not parse media resolution for {source.name}.")
+    try:
+        width = int(parts[0].strip())
+        height = int(parts[1].strip())
+    except ValueError as exc:
+        raise MediaToolError(f"Could not parse media resolution for {source.name}.") from exc
+    if width <= 0 or height <= 0:
+        raise MediaToolError(f"Media resolution was not positive for {source.name}.")
+    return width, height
+
+
 def transcode_video(source: Path, candidate: Path, tools: ToolPaths, preset: str, quality: int) -> str:
     qsv_command = [
         tools.ffmpeg,

@@ -40,6 +40,12 @@ Advanced settings are available from the `Advanced...` button in the app. They s
 - video preset: `veryfast`, `fast`, `medium`, `slow`, `veryslow`
 - video quality, defaulting to `34`
 
+Video encoder notes:
+- `hevc_qsv`: Intel Quick Sync HEVC hardware encoding through `ffmpeg`; usually the fastest option when supported by the machine.
+- `libx265`: software HEVC encoding fallback; slower, but works when Quick Sync is unavailable.
+- preset slider: faster presets usually finish sooner and compress less aggressively; slower presets usually take longer and may reduce size further.
+- quality slider: lower values usually preserve more quality and create larger files; higher values usually compress more and may reduce quality more visibly.
+
 ## Packaging
 
 Install PyInstaller once:
