@@ -17,6 +17,7 @@ from engine import (
     VIDEO_PRESET_OPTIONS,
     AppSettings,
     DeleteResult,
+    ScanProgress,
     ProcessProgress,
     ProcessResult,
     ScanResult,
@@ -57,13 +58,16 @@ class ShrinkMediaApp:
             "skipped": tk.StringVar(value="0"),
             "failed": tk.StringVar(value="0"),
             "archived": tk.StringVar(value="0"),
+            "saved": tk.StringVar(value="0.00 MB"),
         }
 
         self.queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker_thread: threading.Thread | None = None
         self.advanced_window: tk.Toplevel | None = None
+        self.results_menu: tk.Menu | None = None
         self._tree_sort_state: dict[str, bool] = {}
         self._log_search_index = "1.0"
+        self._saved_bytes_total = 0
         self._refresh_advanced_labels()
         self._configure_style()
         self._build_ui()
@@ -122,6 +126,7 @@ class ShrinkMediaApp:
             ("Skipped", "skipped"),
             ("Failed", "failed"),
             ("Archived", "archived"),
+            ("Saved", "saved"),
         ]
         for index, (label, key) in enumerate(summary_items):
             ttk.Label(summary, text=label).grid(row=0, column=index * 2, sticky="w", padx=(0, 6))
@@ -169,6 +174,10 @@ class ShrinkMediaApp:
         tree_scroll_x.grid(row=1, column=0, sticky="ew")
         tree_container.columnconfigure(0, weight=1)
         tree_container.rowconfigure(0, weight=1)
+        self.results_tree.bind("<Control-c>", self._copy_selected_results)
+        self.results_tree.bind("<Button-3>", self._show_results_context_menu)
+        self.results_menu = tk.Menu(self.root, tearoff=0)
+        self.results_menu.add_command(label="Copy", command=self._copy_selected_results)
 
         log_frame = ttk.LabelFrame(content_pane, text="Log", padding=12)
         content_pane.add(log_frame, weight=2)
@@ -204,7 +213,7 @@ class ShrinkMediaApp:
         self._clear_results()
         self._append_log(f"Scanning {folder}")
         self.status_var.set("Scanning folder tree...")
-        self._run_worker("scan", lambda: scan_root(folder, self._build_settings()))
+        self._run_worker("scan", lambda: scan_root(folder, self._build_settings(), progress=self._queue_scan_progress))
 
     def _start_process(self) -> None:
         folder = self._require_folder()
@@ -264,6 +273,9 @@ class ShrinkMediaApp:
     def _queue_progress(self, progress: ProcessProgress) -> None:
         self.queue.put(("progress", progress))
 
+    def _queue_scan_progress(self, progress: ScanProgress) -> None:
+        self.queue.put(("scan_progress", progress))
+
     def _poll_queue(self) -> None:
         while True:
             try:
@@ -273,6 +285,8 @@ class ShrinkMediaApp:
 
             if event_type == "log":
                 self._append_log(str(payload))
+            elif event_type == "scan_progress":
+                self._handle_scan_progress(payload)
             elif event_type == "progress":
                 self._handle_progress(payload)
             elif event_type == "error":
@@ -292,11 +306,11 @@ class ShrinkMediaApp:
             self.summary_vars["images"].set(str(result.image_count))
             self.summary_vars["videos"].set(str(result.video_count))
             self.summary_vars["scanned"].set(str(len(result.work_items)))
+            self.summary_vars["saved"].set("0.00 MB")
             self.status_var.set(
                 f"Scan complete. Qualified {len(result.work_items)} of {len(result.items)} supported file(s)."
             )
             self._append_log(f"Scan complete. Qualified {len(result.work_items)} of {len(result.items)} supported file(s).")
-            self._populate_scan_results(result)
             return
 
         if action == "process" and isinstance(result, ProcessResult):
@@ -307,6 +321,8 @@ class ShrinkMediaApp:
             self.summary_vars["skipped"].set(str(result.skipped))
             self.summary_vars["failed"].set(str(result.failed))
             self.summary_vars["archived"].set(str(result.archived))
+            self._saved_bytes_total = self._calculate_saved_bytes_from_results(result.results)
+            self.summary_vars["saved"].set(self._format_size_delta(self._saved_bytes_total))
             self.status_var.set(
                 f"Process complete. Shrunk={result.shrunk}, Skipped={result.skipped}, Failed={result.failed}, Archived={result.archived}"
             )
@@ -323,23 +339,7 @@ class ShrinkMediaApp:
 
     def _populate_scan_results(self, result: ScanResult) -> None:
         for item in result.items:
-            self.results_tree.insert(
-                "",
-                tk.END,
-                values=(
-                    "ready" if item.ready else "skipped",
-                    "scan",
-                    item.media_kind,
-                    self._format_size(item.size_bytes),
-                    self._format_rate(item.mb_per_10_seconds),
-                    "",
-                    "",
-                    self._format_resolution(item.resolution),
-                    "",
-                    self._format_display_path(item.source_path),
-                    item.detail,
-                ),
-            )
+            self._insert_scan_item(item)
 
     def _populate_process_results(self, result: ProcessResult) -> None:
         for item in result.results:
@@ -353,6 +353,8 @@ class ShrinkMediaApp:
         self.summary_vars["skipped"].set(str(progress.skipped))
         self.summary_vars["failed"].set(str(progress.failed))
         self.summary_vars["archived"].set(str(progress.archived))
+        self._saved_bytes_total += self._saved_bytes_for_item(progress.latest_result)
+        self.summary_vars["saved"].set(self._format_size_delta(self._saved_bytes_total))
         self._insert_process_result(progress.latest_result)
 
         if progress.phase == "cleanup":
@@ -362,6 +364,34 @@ class ShrinkMediaApp:
                 f"Processed {progress.completed} of {progress.scanned}. "
                 f"Shrunk={progress.shrunk}, Skipped={progress.skipped}, Failed={progress.failed}, Archived={progress.archived}"
             )
+
+    def _handle_scan_progress(self, progress: ScanProgress) -> None:
+        self.summary_vars["images"].set(str(progress.image_count))
+        self.summary_vars["videos"].set(str(progress.video_count))
+        self.summary_vars["scanned"].set(str(progress.scanned))
+        self._insert_scan_item(progress.latest_item)
+        self.status_var.set(
+            f"Scanning... checked {progress.scanned} file(s). Qualified Images={progress.image_count}, Videos={progress.video_count}"
+        )
+
+    def _insert_scan_item(self, item) -> None:
+        self.results_tree.insert(
+            "",
+            tk.END,
+            values=(
+                "ready" if item.ready else "skipped",
+                "scan",
+                item.media_kind,
+                self._format_size(item.size_bytes),
+                self._format_rate(item.mb_per_10_seconds),
+                "",
+                "",
+                self._format_resolution(item.resolution),
+                "",
+                self._format_display_path(item.source_path),
+                item.detail,
+            ),
+        )
 
     def _insert_process_result(self, item) -> None:
         self.results_tree.insert(
@@ -558,6 +588,45 @@ class ShrinkMediaApp:
         y = root_y + max((root_height - height) // 2, 0)
         window.geometry(f"{width}x{height}+{x}+{y}")
 
+    def _saved_bytes_for_item(self, item) -> int:
+        if item.size_bytes is None or item.reduced_size_bytes is None:
+            return 0
+        return item.size_bytes - item.reduced_size_bytes
+
+    def _calculate_saved_bytes_from_results(self, results) -> int:
+        return sum(self._saved_bytes_for_item(item) for item in results)
+
+    def _format_size_delta(self, size_bytes: int) -> str:
+        sign = "-" if size_bytes < 0 else ""
+        return f"{sign}{abs(size_bytes) / (1024 * 1024):.2f} MB"
+
+    def _copy_selected_results(self, _event=None) -> str | None:
+        selected = self.results_tree.selection()
+        if not selected:
+            self.status_var.set("No result rows selected to copy.")
+            return "break"
+
+        rows: list[str] = []
+        for item_id in selected:
+            values = self.results_tree.item(item_id, "values")
+            rows.append("\t".join(str(value) for value in values))
+
+        text = "\n".join(rows)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.status_var.set(f"Copied {len(selected)} result row(s) to the clipboard.")
+        return "break"
+
+    def _show_results_context_menu(self, event) -> str:
+        row_id = self.results_tree.identify_row(event.y)
+        if row_id:
+            if row_id not in self.results_tree.selection():
+                self.results_tree.selection_set(row_id)
+            self.results_tree.focus(row_id)
+        if self.results_menu is not None:
+            self.results_menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
     def _on_log_search_changed(self, *_args) -> None:
         self._highlight_log_matches(self.log_search_var.get().strip())
         self._log_search_index = "1.0"
@@ -626,6 +695,8 @@ class ShrinkMediaApp:
         self.summary_vars["scanned"].set("0")
         self.summary_vars["images"].set("0")
         self.summary_vars["videos"].set("0")
+        self.summary_vars["saved"].set("0.00 MB")
+        self._saved_bytes_total = 0
 
     def _append_log(self, message: str) -> None:
         self.log_text.config(state=tk.NORMAL)

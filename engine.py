@@ -35,6 +35,7 @@ DEFAULT_VIDEO_QUALITY = 34
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[["ProcessProgress"], None]
+ScanProgressFn = Callable[["ScanProgress"], None]
 
 
 def _noop(_: str) -> None:
@@ -89,6 +90,14 @@ class ScanResult:
 
 
 @dataclass(frozen=True)
+class ScanProgress:
+    scanned: int
+    image_count: int
+    video_count: int
+    latest_item: ScanItem
+
+
+@dataclass(frozen=True)
 class ProcessResult:
     root_path: Path
     image_count: int
@@ -122,13 +131,18 @@ class DeleteResult:
     detail: str
 
 
-def scan_root(root_path: str | Path, settings: AppSettings | None = None) -> ScanResult:
+def scan_root(
+    root_path: str | Path,
+    settings: AppSettings | None = None,
+    progress: ScanProgressFn | None = None,
+) -> ScanResult:
     root = _validate_root(root_path)
     config = _normalize_settings(settings)
     tools = discover_tools(require_ffmpeg=False, require_ffprobe=True, require_exiftool=False)
     items: list[ScanItem] = []
     image_count = 0
     video_count = 0
+    scanned = 0
     archive_exists = (root / ARCHIVE_DIR_NAME).exists()
 
     for directory, dirnames, filenames in os.walk(root):
@@ -156,6 +170,16 @@ def scan_root(root_path: str | Path, settings: AppSettings | None = None) -> Sca
                 image_count += 1
             elif item.ready:
                 video_count += 1
+            scanned += 1
+            if progress is not None:
+                progress(
+                    ScanProgress(
+                        scanned=scanned,
+                        image_count=image_count,
+                        video_count=video_count,
+                        latest_item=item,
+                    )
+                )
 
     items = sorted(items, key=lambda item: str(item.source_path).lower())
     work_items = [item for item in items if item.ready]
