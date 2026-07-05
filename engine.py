@@ -213,95 +213,136 @@ def process_root(
         require_ffprobe=True,
         require_exiftool=_mode_includes(config.media_mode, "image"),
     )
-
-    logger(f"Selected root: {root}")
-    logger(
-        "Scan settings: "
-        f"mode={config.media_mode}, "
-        f"min_image_mb={config.min_image_megabytes:.1f}, "
-        f"min_video_mb_per_10s={config.min_video_megabytes_per_10_seconds:.1f}, "
-        f"preset={config.video_preset}, "
-        f"quality={config.video_quality}"
-    )
-    logger("Resolving any legacy tmp-/new- leftovers first.")
-
-    results: list[FileResult] = []
-    skip_paths: set[Path] = set()
-    cache = _load_scan_cache(root, config)
-
-    for legacy_result, skip_path in _resolve_legacy_state(
-        root,
-        tools,
-        logger,
-        candidate_paths=cache["legacy_candidates"] if cache is not None else None,
-    ):
-        results.append(legacy_result)
-        if skip_path is not None:
-            skip_paths.add(skip_path)
-
-    if cache is not None:
-        work_items = cache["work_items"]
-        image_count = sum(1 for item in work_items if item.media_kind == "image")
-        video_count = sum(1 for item in work_items if item.media_kind == "video")
-        scan = ScanResult(
-            root_path=root,
-            items=work_items,
-            work_items=work_items,
-            image_count=image_count,
-            video_count=video_count,
-            archive_exists=(root / ARCHIVE_DIR_NAME).exists(),
+    try:
+        logger(f"Selected root: {root}")
+        logger(
+            "Scan settings: "
+            f"mode={config.media_mode}, "
+            f"min_image_mb={config.min_image_megabytes:.1f}, "
+            f"min_video_mb_per_10s={config.min_video_megabytes_per_10_seconds:.1f}, "
+            f"preset={config.video_preset}, "
+            f"quality={config.video_quality}"
         )
-        logger(f"Loaded {len(work_items)} qualified file(s) from the temporary scan cache.")
-    else:
-        scan = scan_root(root, config)
-    scanned = len(scan.work_items)
-    completed = 0
-    shrunk = 0
-    skipped = 0
-    failed = 0
-    archived = 0
+        logger("Resolving any legacy tmp-/new- leftovers first.")
 
-    for legacy_result in results:
-        archived += legacy_result.archive_count
-        if legacy_result.action == "failed":
-            failed += 1
-        if progress is not None:
-            progress(
-                ProcessProgress(
-                    phase="cleanup",
-                    image_count=scan.image_count,
-                    video_count=scan.video_count,
-                    scanned=scanned,
-                    completed=completed,
-                    shrunk=shrunk,
-                    skipped=skipped,
-                    failed=failed,
-                    archived=archived,
-                    latest_result=legacy_result,
-                )
+        results: list[FileResult] = []
+        skip_paths: set[Path] = set()
+        cache = _load_scan_cache(root, config)
+
+        for legacy_result, skip_path in _resolve_legacy_state(
+            root,
+            tools,
+            logger,
+            candidate_paths=cache["legacy_candidates"] if cache is not None else None,
+        ):
+            results.append(legacy_result)
+            if skip_path is not None:
+                skip_paths.add(skip_path)
+
+        if cache is not None:
+            work_items = cache["work_items"]
+            image_count = sum(1 for item in work_items if item.media_kind == "image")
+            video_count = sum(1 for item in work_items if item.media_kind == "video")
+            scan = ScanResult(
+                root_path=root,
+                items=work_items,
+                work_items=work_items,
+                image_count=image_count,
+                video_count=video_count,
+                archive_exists=(root / ARCHIVE_DIR_NAME).exists(),
             )
+            logger(f"Loaded {len(work_items)} qualified file(s) from the temporary scan cache.")
+        else:
+            scan = scan_root(root, config)
+        scanned = len(scan.work_items)
+        completed = 0
+        shrunk = 0
+        skipped = 0
+        failed = 0
+        archived = 0
 
-    logger(f"Found {scan.image_count} eligible image(s) and {scan.video_count} eligible video(s) to process.")
+        for legacy_result in results:
+            archived += legacy_result.archive_count
+            if legacy_result.action == "failed":
+                failed += 1
+            if progress is not None:
+                progress(
+                    ProcessProgress(
+                        phase="cleanup",
+                        image_count=scan.image_count,
+                        video_count=scan.video_count,
+                        scanned=scanned,
+                        completed=completed,
+                        shrunk=shrunk,
+                        skipped=skipped,
+                        failed=failed,
+                        archived=archived,
+                        latest_result=legacy_result,
+                    )
+                )
 
-    for item in scan.work_items:
-        if item.source_path in skip_paths:
-            results.append(
-                FileResult(
+        logger(f"Found {scan.image_count} eligible image(s) and {scan.video_count} eligible video(s) to process.")
+
+        for item in scan.work_items:
+            if item.source_path in skip_paths:
+                results.append(
+                    FileResult(
+                        source_path=item.source_path,
+                        media_kind=item.media_kind,
+                        action="skipped",
+                        status="ok",
+                        detail="Already resolved from a legacy in-progress file.",
+                        archive_count=0,
+                        size_bytes=item.size_bytes,
+                        resolution=item.resolution,
+                        mb_per_10_seconds=item.mb_per_10_seconds,
+                        reduced_size_bytes=item.size_bytes,
+                        reduced_resolution=item.resolution,
+                        reduced_mb_per_10_seconds=item.mb_per_10_seconds,
+                    )
+                )
+                skipped += 1
+                completed += 1
+                if progress is not None:
+                    progress(
+                        ProcessProgress(
+                            phase="process",
+                            image_count=scan.image_count,
+                            video_count=scan.video_count,
+                            scanned=scanned,
+                            completed=completed,
+                            shrunk=shrunk,
+                            skipped=skipped,
+                            failed=failed,
+                            archived=archived,
+                            latest_result=results[-1],
+                        )
+                    )
+                continue
+
+            try:
+                result = _process_item(root, item, tools, config, logger)
+            except Exception as exc:  # pragma: no cover - defensive UI safety
+                result = FileResult(
                     source_path=item.source_path,
                     media_kind=item.media_kind,
-                    action="skipped",
-                    status="ok",
-                    detail="Already resolved from a legacy in-progress file.",
-                    archive_count=0,
+                    action="failed",
+                    status="error",
+                    detail=str(exc),
                     size_bytes=item.size_bytes,
                     resolution=item.resolution,
                     mb_per_10_seconds=item.mb_per_10_seconds,
-                    reduced_size_bytes=item.size_bytes,
                     reduced_resolution=item.resolution,
-                    reduced_mb_per_10_seconds=item.mb_per_10_seconds,
                 )
-            )
-            skipped += 1
+
+            results.append(result)
+            archived += result.archive_count
+            if result.action == "shrunk":
+                shrunk += 1
+            elif result.action == "skipped":
+                skipped += 1
+            elif result.action == "failed":
+                failed += 1
             completed += 1
             if progress is not None:
                 progress(
@@ -315,62 +356,23 @@ def process_root(
                         skipped=skipped,
                         failed=failed,
                         archived=archived,
-                        latest_result=results[-1],
+                        latest_result=result,
                     )
                 )
-            continue
 
-        try:
-            result = _process_item(root, item, tools, config, logger)
-        except Exception as exc:  # pragma: no cover - defensive UI safety
-            result = FileResult(
-                source_path=item.source_path,
-                media_kind=item.media_kind,
-                action="failed",
-                status="error",
-                detail=str(exc),
-                size_bytes=item.size_bytes,
-                resolution=item.resolution,
-                mb_per_10_seconds=item.mb_per_10_seconds,
-                reduced_resolution=item.resolution,
-            )
-
-        results.append(result)
-        archived += result.archive_count
-        if result.action == "shrunk":
-            shrunk += 1
-        elif result.action == "skipped":
-            skipped += 1
-        elif result.action == "failed":
-            failed += 1
-        completed += 1
-        if progress is not None:
-            progress(
-                ProcessProgress(
-                    phase="process",
-                    image_count=scan.image_count,
-                    video_count=scan.video_count,
-                    scanned=scanned,
-                    completed=completed,
-                    shrunk=shrunk,
-                    skipped=skipped,
-                    failed=failed,
-                    archived=archived,
-                    latest_result=result,
-                )
-            )
-
-    return ProcessResult(
-        root_path=root,
-        image_count=scan.image_count,
-        video_count=scan.video_count,
-        scanned=scanned,
-        shrunk=shrunk,
-        skipped=skipped,
-        failed=failed,
-        archived=archived,
-        results=results,
-    )
+        return ProcessResult(
+            root_path=root,
+            image_count=scan.image_count,
+            video_count=scan.video_count,
+            scanned=scanned,
+            shrunk=shrunk,
+            skipped=skipped,
+            failed=failed,
+            archived=archived,
+            results=results,
+        )
+    finally:
+        _delete_mfxlib_log(logger)
 
 
 def delete_archive(root_path: str | Path) -> DeleteResult:
@@ -522,6 +524,22 @@ def _megabytes_per_10_seconds(size_bytes: int, duration_seconds: float) -> float
 
 def _scan_cache_path(root: Path) -> Path:
     return root / ARCHIVE_DIR_NAME / SCAN_CACHE_NAME
+
+
+def _delete_mfxlib_log(log: LogFn) -> None:
+    temp_dir = os.environ.get("TEMP") or os.environ.get("TMP")
+    if not temp_dir:
+        return
+
+    log_path = Path(temp_dir) / "mfxlib.log"
+    if not log_path.exists():
+        return
+
+    try:
+        log_path.unlink()
+        log(f"Deleted temporary codec log: {log_path}")
+    except OSError as exc:
+        log(f"Could not delete temporary codec log {log_path}: {exc}")
 
 
 def _serialize_scan_item(root: Path, item: ScanItem) -> dict[str, object]:
