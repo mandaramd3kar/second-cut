@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import tempfile
@@ -21,6 +22,7 @@ from media_tools import (
 ARCHIVE_DIR_NAME = ".to-be-deleted"
 ORIGINALS_DIR_NAME = "originals"
 REJECTED_DIR_NAME = "rejected-generated"
+SCAN_CACHE_NAME = "scan-cache.json"
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg"}
 VIDEO_EXTENSIONS = {".mp4", ".mov"}
@@ -140,6 +142,7 @@ def scan_root(
     config = _normalize_settings(settings)
     tools = discover_tools(require_ffmpeg=False, require_ffprobe=True, require_exiftool=False)
     items: list[ScanItem] = []
+    legacy_candidates: list[Path] = []
     image_count = 0
     video_count = 0
     scanned = 0
@@ -152,6 +155,7 @@ def scan_root(
         for filename in filenames:
             path = current_dir / filename
             if _is_legacy_image_tmp(path) or _is_legacy_video_candidate(path):
+                legacy_candidates.append(path)
                 continue
 
             media_kind = _media_kind(path)
@@ -183,6 +187,7 @@ def scan_root(
 
     items = sorted(items, key=lambda item: str(item.source_path).lower())
     work_items = [item for item in items if item.ready]
+    _write_scan_cache(root, config, work_items, legacy_candidates)
 
     return ScanResult(
         root_path=root,
@@ -222,13 +227,33 @@ def process_root(
 
     results: list[FileResult] = []
     skip_paths: set[Path] = set()
+    cache = _load_scan_cache(root, config)
 
-    for legacy_result, skip_path in _resolve_legacy_state(root, tools, logger):
+    for legacy_result, skip_path in _resolve_legacy_state(
+        root,
+        tools,
+        logger,
+        candidate_paths=cache["legacy_candidates"] if cache is not None else None,
+    ):
         results.append(legacy_result)
         if skip_path is not None:
             skip_paths.add(skip_path)
 
-    scan = scan_root(root, config)
+    if cache is not None:
+        work_items = cache["work_items"]
+        image_count = sum(1 for item in work_items if item.media_kind == "image")
+        video_count = sum(1 for item in work_items if item.media_kind == "video")
+        scan = ScanResult(
+            root_path=root,
+            items=work_items,
+            work_items=work_items,
+            image_count=image_count,
+            video_count=video_count,
+            archive_exists=(root / ARCHIVE_DIR_NAME).exists(),
+        )
+        logger(f"Loaded {len(work_items)} qualified file(s) from the temporary scan cache.")
+    else:
+        scan = scan_root(root, config)
     scanned = len(scan.work_items)
     completed = 0
     shrunk = 0
@@ -374,6 +399,14 @@ def _normalize_settings(settings: AppSettings | None) -> AppSettings:
     return config
 
 
+def _settings_signature(settings: AppSettings) -> dict[str, object]:
+    return {
+        "media_mode": settings.media_mode,
+        "min_image_megabytes": settings.min_image_megabytes,
+        "min_video_megabytes_per_10_seconds": settings.min_video_megabytes_per_10_seconds,
+    }
+
+
 def _mode_includes(media_mode: str, media_kind: str) -> bool:
     if media_mode == MEDIA_MODE_BOTH:
         return True
@@ -487,24 +520,101 @@ def _megabytes_per_10_seconds(size_bytes: int, duration_seconds: float) -> float
     return (_bytes_to_megabytes(size_bytes) * 10.0) / duration_seconds
 
 
-def _resolve_legacy_state(root: Path, tools: ToolPaths, log: LogFn) -> list[tuple[FileResult, Path | None]]:
+def _scan_cache_path(root: Path) -> Path:
+    return root / ARCHIVE_DIR_NAME / SCAN_CACHE_NAME
+
+
+def _serialize_scan_item(root: Path, item: ScanItem) -> dict[str, object]:
+    return {
+        "source_path": str(item.source_path.relative_to(root)),
+        "media_kind": item.media_kind,
+        "size_bytes": item.size_bytes,
+        "resolution": list(item.resolution) if item.resolution is not None else None,
+        "duration_seconds": item.duration_seconds,
+        "mb_per_10_seconds": item.mb_per_10_seconds,
+        "ready": item.ready,
+        "detail": item.detail,
+    }
+
+
+def _deserialize_scan_item(root: Path, payload: dict[str, object]) -> ScanItem:
+    resolution_payload = payload.get("resolution")
+    resolution = tuple(resolution_payload) if resolution_payload is not None else None
+    return ScanItem(
+        source_path=root / str(payload["source_path"]),
+        media_kind=str(payload["media_kind"]),
+        size_bytes=int(payload["size_bytes"]),
+        resolution=resolution,  # type: ignore[arg-type]
+        duration_seconds=float(payload["duration_seconds"]) if payload.get("duration_seconds") is not None else None,
+        mb_per_10_seconds=float(payload["mb_per_10_seconds"]) if payload.get("mb_per_10_seconds") is not None else None,
+        ready=bool(payload["ready"]),
+        detail=str(payload["detail"]),
+    )
+
+
+def _write_scan_cache(root: Path, settings: AppSettings, work_items: list[ScanItem], legacy_candidates: list[Path]) -> None:
+    cache_path = _scan_cache_path(root)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "settings": _settings_signature(settings),
+        "work_items": [_serialize_scan_item(root, item) for item in work_items],
+        "legacy_candidates": sorted(str(path.relative_to(root)) for path in legacy_candidates if path.exists()),
+    }
+    cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _load_scan_cache(root: Path, settings: AppSettings) -> dict[str, object] | None:
+    cache_path = _scan_cache_path(root)
+    if not cache_path.exists():
+        return None
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if payload.get("settings") != _settings_signature(settings):
+        return None
+
+    work_items = [
+        item
+        for item in (_deserialize_scan_item(root, entry) for entry in payload.get("work_items", []))
+        if item.source_path.exists()
+    ]
+    legacy_candidates = [root / str(value) for value in payload.get("legacy_candidates", [])]
+    return {
+        "work_items": work_items,
+        "legacy_candidates": legacy_candidates,
+    }
+
+
+def _resolve_legacy_state(
+    root: Path,
+    tools: ToolPaths,
+    log: LogFn,
+    candidate_paths: list[Path] | None = None,
+) -> list[tuple[FileResult, Path | None]]:
     del tools  # kept for future extension; legacy resolution is size-based only
     resolved: list[tuple[FileResult, Path | None]] = []
 
-    for directory, dirnames, filenames in os.walk(root):
-        current_dir = Path(directory)
-        dirnames[:] = [name for name in dirnames if name != ARCHIVE_DIR_NAME]
+    if candidate_paths is not None:
+        paths_to_check = sorted({path for path in candidate_paths}, key=lambda path: str(path).lower())
+    else:
+        paths_to_check = []
+        for directory, dirnames, filenames in os.walk(root):
+            current_dir = Path(directory)
+            dirnames[:] = [name for name in dirnames if name != ARCHIVE_DIR_NAME]
+            for filename in sorted(filenames, key=str.lower):
+                paths_to_check.append(current_dir / filename)
 
-        for filename in sorted(filenames, key=str.lower):
-            path = current_dir / filename
+    for path in paths_to_check:
+        if not path.exists():
+            continue
+        if _is_legacy_image_tmp(path):
+            resolved.extend(_resolve_legacy_image(root, path, log))
+            continue
 
-            if _is_legacy_image_tmp(path):
-                resolved.extend(_resolve_legacy_image(root, path, log))
-                continue
-
-            parsed = _parse_legacy_video_candidate(path)
-            if parsed is not None:
-                resolved.extend(_resolve_legacy_video(root, path, parsed[0], parsed[1], log))
+        parsed = _parse_legacy_video_candidate(path)
+        if parsed is not None:
+            resolved.extend(_resolve_legacy_video(root, path, parsed[0], parsed[1], log))
 
     return resolved
 

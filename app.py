@@ -598,7 +598,10 @@ class ShrinkMediaApp:
 
     def _format_size_delta(self, size_bytes: int) -> str:
         sign = "-" if size_bytes < 0 else ""
-        return f"{sign}{abs(size_bytes) / (1024 * 1024):.2f} MB"
+        size_megabytes = abs(size_bytes) / (1024 * 1024)
+        if size_megabytes > 999:
+            return f"{sign}{size_megabytes / 1024:.2f} GB"
+        return f"{sign}{size_megabytes:.2f} MB"
 
     def _copy_selected_results(self, _event=None) -> str | None:
         selected = self.results_tree.selection()
