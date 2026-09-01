@@ -12,6 +12,8 @@ Simple desktop app for shrinking media folders without manual cleanup steps.
 - Qualifies videos for processing only when their measured MB per 10 seconds exceeds the configured threshold.
 - Ignores anything already inside `.to-be-deleted`.
 - Replaces successful outputs in place so the visible files keep the real names.
+- Generates and attaches representative cover thumbnails to compacted MP4 videos by default.
+- Adds missing thumbnails to existing MP4 files as a standalone folder operation without compacting them.
 - Moves originals and rejected generated files into `.to-be-deleted` instead of deleting them.
 - Resolves old `tmp-...` and `new-...` leftovers from the shell-script workflow.
 
@@ -32,6 +34,8 @@ Platform notes:
 ```powershell
 python app.py
 ```
+
+Leave **Add a thumbnail after compacting each video** checked to run thumbnail generation as the final video-compaction step. It is enabled by default. Use **Add Thumbnails** to recursively add thumbnails to existing MP4 files without compacting them; MP4s that already contain attached cover art are skipped.
 
 Advanced settings are available from the `Advanced...` button in the app. They stay hidden from the main screen by default and let you change:
 
@@ -73,6 +77,8 @@ The build output is created under `dist\`.
 - A successful JPEG shrink archives the original under `.to-be-deleted\originals\...`.
 - A successful MP4 shrink keeps the original filename.
 - A successful MOV shrink keeps the same basename and normalizes the final kept file to `.mp4`.
+- Thumbnail images are sampled from 300 frames, scaled to 10% of the video dimensions, attached as MP4 cover art, and then deleted from the temporary workspace.
+- Standalone thumbnail generation archives the prior MP4 under `.to-be-deleted\originals\...` before promoting the updated file.
 - If a generated file is larger than the current file, the current file stays in place and the generated file is moved under `.to-be-deleted\rejected-generated\...`.
 - If a legacy `tmp-...` image is present and the current image is larger, the app restores the `tmp-...` file back to the real filename before continuing.
 - If a legacy `new-...` video is present and is smaller than the original, the app promotes it and archives the original automatically.

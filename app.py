@@ -7,6 +7,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from engine import (
+    DEFAULT_ADD_VIDEO_THUMBNAILS,
     DEFAULT_MIN_IMAGE_MEGABYTES,
     DEFAULT_MIN_VIDEO_MEGABYTES_PER_10_SECONDS,
     DEFAULT_VIDEO_PRESET,
@@ -21,6 +22,7 @@ from engine import (
     ProcessProgress,
     ProcessResult,
     ScanResult,
+    add_thumbnails_root,
     delete_archive,
     process_root,
     scan_root,
@@ -42,6 +44,7 @@ class ShrinkMediaApp:
         self.min_video_mb_per_10s_var = tk.DoubleVar(value=DEFAULT_MIN_VIDEO_MEGABYTES_PER_10_SECONDS)
         self.video_preset_index_var = tk.IntVar(value=VIDEO_PRESET_OPTIONS.index(DEFAULT_VIDEO_PRESET))
         self.video_quality_var = tk.IntVar(value=DEFAULT_VIDEO_QUALITY)
+        self.add_video_thumbnails_var = tk.BooleanVar(value=DEFAULT_ADD_VIDEO_THUMBNAILS)
         self.image_threshold_label_var = tk.StringVar()
         self.video_threshold_label_var = tk.StringVar()
         self.video_preset_label_var = tk.StringVar()
@@ -58,6 +61,7 @@ class ShrinkMediaApp:
             "skipped": tk.StringVar(value="0"),
             "failed": tk.StringVar(value="0"),
             "archived": tk.StringVar(value="0"),
+            "thumbnails": tk.StringVar(value="0"),
             "saved": tk.StringVar(value="0.00 MB"),
         }
 
@@ -101,6 +105,9 @@ class ShrinkMediaApp:
         self.process_button = ttk.Button(button_row, text="Process", command=self._start_process)
         self.process_button.pack(side=tk.LEFT, padx=8)
 
+        self.thumbnail_button = ttk.Button(button_row, text="Add Thumbnails", command=self._start_thumbnails)
+        self.thumbnail_button.pack(side=tk.LEFT, padx=(0, 8))
+
         self.delete_button = ttk.Button(button_row, text="Delete .to-be-deleted", command=self._start_delete)
         self.delete_button.pack(side=tk.LEFT)
 
@@ -115,6 +122,18 @@ class ShrinkMediaApp:
         )
         ttk.Button(button_row, text="Advanced...", command=self._open_advanced_settings).pack(side=tk.RIGHT)
 
+        video_options_row = ttk.Frame(frame)
+        video_options_row.pack(fill=tk.X, pady=(0, 12))
+        ttk.Checkbutton(
+            video_options_row,
+            text="Add a thumbnail after compacting each video",
+            variable=self.add_video_thumbnails_var,
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            video_options_row,
+            text="The Add Thumbnails button processes existing MP4s without compacting them.",
+        ).pack(side=tk.LEFT, padx=(16, 0))
+
         summary = ttk.LabelFrame(frame, text="Summary", padding=12)
         summary.pack(fill=tk.X)
 
@@ -126,12 +145,15 @@ class ShrinkMediaApp:
             ("Skipped", "skipped"),
             ("Failed", "failed"),
             ("Archived", "archived"),
+            ("Thumbnails", "thumbnails"),
             ("Saved", "saved"),
         ]
         for index, (label, key) in enumerate(summary_items):
-            ttk.Label(summary, text=label).grid(row=0, column=index * 2, sticky="w", padx=(0, 6))
+            row = index // 5
+            column = (index % 5) * 2
+            ttk.Label(summary, text=label).grid(row=row, column=column, sticky="w", padx=(0, 6), pady=2)
             ttk.Label(summary, textvariable=self.summary_vars[key], width=8).grid(
-                row=0, column=index * 2 + 1, sticky="w", padx=(0, 16)
+                row=row, column=column + 1, sticky="w", padx=(0, 16), pady=2
             )
 
         content_pane = ttk.Panedwindow(frame, orient=tk.VERTICAL)
@@ -225,6 +247,18 @@ class ShrinkMediaApp:
         self._run_worker(
             "process",
             lambda: process_root(folder, self._build_settings(), log=self._queue_log, progress=self._queue_progress),
+        )
+
+    def _start_thumbnails(self) -> None:
+        folder = self._require_folder()
+        if folder is None:
+            return
+        self._clear_results()
+        self._append_log(f"Adding missing MP4 thumbnails under {folder}")
+        self.status_var.set("Inspecting MP4 files and adding missing thumbnails...")
+        self._run_worker(
+            "thumbnails",
+            lambda: add_thumbnails_root(folder, log=self._queue_log, progress=self._queue_progress),
         )
 
     def _start_delete(self) -> None:
@@ -321,6 +355,7 @@ class ShrinkMediaApp:
             self.summary_vars["skipped"].set(str(result.skipped))
             self.summary_vars["failed"].set(str(result.failed))
             self.summary_vars["archived"].set(str(result.archived))
+            self.summary_vars["thumbnails"].set(str(result.thumbnails_added))
             self._saved_bytes_total = self._calculate_saved_bytes_from_results(result.results)
             self.summary_vars["saved"].set(self._format_size_delta(self._saved_bytes_total))
             self.status_var.set(
@@ -328,6 +363,28 @@ class ShrinkMediaApp:
             )
             self._append_log(
                 f"Process complete. Shrunk={result.shrunk}, Skipped={result.skipped}, Failed={result.failed}, Archived={result.archived}"
+            )
+            return
+
+        if action == "thumbnails" and isinstance(result, ProcessResult):
+            self.summary_vars["images"].set("0")
+            self.summary_vars["videos"].set(str(result.video_count))
+            self.summary_vars["scanned"].set(str(result.scanned))
+            self.summary_vars["shrunk"].set("0")
+            self.summary_vars["skipped"].set(str(result.skipped))
+            self.summary_vars["failed"].set(str(result.failed))
+            self.summary_vars["archived"].set(str(result.archived))
+            self.summary_vars["thumbnails"].set(str(result.thumbnails_added))
+            self._saved_bytes_total = self._calculate_saved_bytes_from_results(result.results)
+            self.summary_vars["saved"].set(self._format_size_delta(self._saved_bytes_total))
+            self.status_var.set(
+                "Thumbnail pass complete. "
+                f"Added={result.thumbnails_added}, Skipped={result.skipped}, Failed={result.failed}"
+            )
+            self._append_log(
+                "Thumbnail pass complete. "
+                f"Added={result.thumbnails_added}, Skipped={result.skipped}, Failed={result.failed}, "
+                f"Archived={result.archived}"
             )
             return
 
@@ -353,12 +410,18 @@ class ShrinkMediaApp:
         self.summary_vars["skipped"].set(str(progress.skipped))
         self.summary_vars["failed"].set(str(progress.failed))
         self.summary_vars["archived"].set(str(progress.archived))
+        self.summary_vars["thumbnails"].set(str(progress.thumbnails_added))
         self._saved_bytes_total += self._saved_bytes_for_item(progress.latest_result)
         self.summary_vars["saved"].set(self._format_size_delta(self._saved_bytes_total))
         self._insert_process_result(progress.latest_result)
 
         if progress.phase == "cleanup":
             self.status_var.set("Resolving legacy tmp-/new- leftovers...")
+        elif progress.phase == "thumbnail":
+            self.status_var.set(
+                f"Checked {progress.completed} of {progress.scanned} MP4s. "
+                f"Added={progress.thumbnails_added}, Skipped={progress.skipped}, Failed={progress.failed}"
+            )
         else:
             self.status_var.set(
                 f"Processed {progress.completed} of {progress.scanned}. "
@@ -447,6 +510,7 @@ class ShrinkMediaApp:
             min_video_megabytes_per_10_seconds=round(self.min_video_mb_per_10s_var.get(), 1),
             video_preset=VIDEO_PRESET_OPTIONS[self.video_preset_index_var.get()],
             video_quality=int(self.video_quality_var.get()),
+            add_video_thumbnails=bool(self.add_video_thumbnails_var.get()),
         )
 
     def _open_advanced_settings(self) -> None:
@@ -546,6 +610,7 @@ class ShrinkMediaApp:
         self.min_video_mb_per_10s_var.set(DEFAULT_MIN_VIDEO_MEGABYTES_PER_10_SECONDS)
         self.video_preset_index_var.set(VIDEO_PRESET_OPTIONS.index(DEFAULT_VIDEO_PRESET))
         self.video_quality_var.set(DEFAULT_VIDEO_QUALITY)
+        self.add_video_thumbnails_var.set(DEFAULT_ADD_VIDEO_THUMBNAILS)
         self._refresh_advanced_labels()
 
     def _on_advanced_scale_changed(self, _value: str) -> None:
@@ -681,6 +746,7 @@ class ShrinkMediaApp:
         state = tk.DISABLED if busy else tk.NORMAL
         self.scan_button.config(state=state)
         self.process_button.config(state=state)
+        self.thumbnail_button.config(state=state)
         self.delete_button.config(state=state)
         if busy:
             self.root.config(cursor="watch")
@@ -695,6 +761,7 @@ class ShrinkMediaApp:
         self.summary_vars["skipped"].set("0")
         self.summary_vars["failed"].set("0")
         self.summary_vars["archived"].set("0")
+        self.summary_vars["thumbnails"].set("0")
         self.summary_vars["scanned"].set("0")
         self.summary_vars["images"].set("0")
         self.summary_vars["videos"].set("0")
