@@ -11,12 +11,14 @@ from typing import Callable
 from media_tools import (
     MediaToolError,
     ToolPaths,
+    add_video_thumbnail,
     discover_tools,
     file_size,
     probe_media_resolution,
     probe_video_duration,
     transcode_image,
     transcode_video,
+    video_has_attached_thumbnail,
 )
 
 ARCHIVE_DIR_NAME = ".to-be-deleted"
@@ -34,6 +36,7 @@ DEFAULT_MIN_IMAGE_MEGABYTES = 1.4
 DEFAULT_MIN_VIDEO_MEGABYTES_PER_10_SECONDS = 1.0
 DEFAULT_VIDEO_PRESET = "veryfast"
 DEFAULT_VIDEO_QUALITY = 34
+DEFAULT_ADD_VIDEO_THUMBNAILS = True
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[["ProcessProgress"], None]
@@ -63,6 +66,7 @@ class AppSettings:
     min_video_megabytes_per_10_seconds: float = DEFAULT_MIN_VIDEO_MEGABYTES_PER_10_SECONDS
     video_preset: str = DEFAULT_VIDEO_PRESET
     video_quality: int = DEFAULT_VIDEO_QUALITY
+    add_video_thumbnails: bool = DEFAULT_ADD_VIDEO_THUMBNAILS
 
 
 @dataclass(frozen=True)
@@ -79,6 +83,7 @@ class FileResult:
     reduced_size_bytes: int | None = None
     reduced_resolution: tuple[int, int] | None = None
     reduced_mb_per_10_seconds: float | None = None
+    thumbnail_added: bool = False
 
 
 @dataclass(frozen=True)
@@ -109,6 +114,7 @@ class ProcessResult:
     skipped: int
     failed: int
     archived: int
+    thumbnails_added: int = 0
     results: list[FileResult] = field(default_factory=list)
 
 
@@ -123,6 +129,7 @@ class ProcessProgress:
     skipped: int
     failed: int
     archived: int
+    thumbnails_added: int
     latest_result: FileResult
 
 
@@ -221,7 +228,8 @@ def process_root(
             f"min_image_mb={config.min_image_megabytes:.1f}, "
             f"min_video_mb_per_10s={config.min_video_megabytes_per_10_seconds:.1f}, "
             f"preset={config.video_preset}, "
-            f"quality={config.video_quality}"
+            f"quality={config.video_quality}, "
+            f"add_video_thumbnails={config.add_video_thumbnails}"
         )
         logger("Resolving any legacy tmp-/new- leftovers first.")
 
@@ -260,6 +268,7 @@ def process_root(
         skipped = 0
         failed = 0
         archived = 0
+        thumbnails_added = 0
 
         for legacy_result in results:
             archived += legacy_result.archive_count
@@ -277,6 +286,7 @@ def process_root(
                         skipped=skipped,
                         failed=failed,
                         archived=archived,
+                        thumbnails_added=thumbnails_added,
                         latest_result=legacy_result,
                     )
                 )
@@ -315,6 +325,7 @@ def process_root(
                             skipped=skipped,
                             failed=failed,
                             archived=archived,
+                            thumbnails_added=thumbnails_added,
                             latest_result=results[-1],
                         )
                     )
@@ -337,6 +348,8 @@ def process_root(
 
             results.append(result)
             archived += result.archive_count
+            if result.thumbnail_added:
+                thumbnails_added += 1
             if result.action == "shrunk":
                 shrunk += 1
             elif result.action == "skipped":
@@ -356,6 +369,7 @@ def process_root(
                         skipped=skipped,
                         failed=failed,
                         archived=archived,
+                        thumbnails_added=thumbnails_added,
                         latest_result=result,
                     )
                 )
@@ -369,6 +383,79 @@ def process_root(
             skipped=skipped,
             failed=failed,
             archived=archived,
+            thumbnails_added=thumbnails_added,
+            results=results,
+        )
+    finally:
+        _delete_mfxlib_log(logger)
+
+
+def add_thumbnails_root(
+    root_path: str | Path,
+    log: LogFn | None = None,
+    progress: ProgressFn | None = None,
+) -> ProcessResult:
+    """Add thumbnails to MP4 files under a root without compacting them."""
+    logger = log or _noop
+    root = _validate_root(root_path)
+    tools = discover_tools(require_ffmpeg=True, require_ffprobe=True, require_exiftool=False)
+    try:
+        source_paths: list[Path] = []
+        for directory, dirnames, filenames in os.walk(root):
+            current_dir = Path(directory)
+            dirnames[:] = [name for name in dirnames if name != ARCHIVE_DIR_NAME]
+            for filename in filenames:
+                path = current_dir / filename
+                if path.suffix.lower() == ".mp4" and not _is_legacy_video_candidate(path):
+                    source_paths.append(path)
+        source_paths.sort(key=lambda path: str(path).lower())
+
+        scanned = len(source_paths)
+        skipped = 0
+        failed = 0
+        archived = 0
+        thumbnails_added = 0
+        results: list[FileResult] = []
+        logger(f"Found {scanned} MP4 file(s) to inspect for thumbnails under {root}.")
+
+        for completed, source_path in enumerate(source_paths, start=1):
+            result = _add_thumbnail_to_existing_video(root, source_path, tools, logger)
+            results.append(result)
+            archived += result.archive_count
+            if result.thumbnail_added:
+                thumbnails_added += 1
+            elif result.action == "skipped":
+                skipped += 1
+            elif result.action == "failed":
+                failed += 1
+
+            if progress is not None:
+                progress(
+                    ProcessProgress(
+                        phase="thumbnail",
+                        image_count=0,
+                        video_count=scanned,
+                        scanned=scanned,
+                        completed=completed,
+                        shrunk=0,
+                        skipped=skipped,
+                        failed=failed,
+                        archived=archived,
+                        thumbnails_added=thumbnails_added,
+                        latest_result=result,
+                    )
+                )
+
+        return ProcessResult(
+            root_path=root,
+            image_count=0,
+            video_count=scanned,
+            scanned=scanned,
+            shrunk=0,
+            skipped=skipped,
+            failed=failed,
+            archived=archived,
+            thumbnails_added=thumbnails_added,
             results=results,
         )
     finally:
@@ -398,6 +485,8 @@ def _normalize_settings(settings: AppSettings | None) -> AppSettings:
         raise ValueError(f"Unsupported media mode: {config.media_mode}")
     if config.video_preset not in VIDEO_PRESET_OPTIONS:
         raise ValueError(f"Unsupported video preset: {config.video_preset}")
+    if not isinstance(config.add_video_thumbnails, bool):
+        raise ValueError("add_video_thumbnails must be true or false.")
     return config
 
 
@@ -829,6 +918,106 @@ def _resolve_legacy_video(
     return results
 
 
+def _video_file_metrics(
+    source_path: Path,
+    tools: ToolPaths,
+) -> tuple[int, tuple[int, int] | None, float | None]:
+    size_bytes = file_size(source_path)
+    resolution = None
+    try:
+        resolution = probe_media_resolution(source_path, tools)
+    except MediaToolError:
+        pass
+
+    mb_per_10_seconds = None
+    try:
+        duration_seconds = probe_video_duration(source_path, tools)
+        mb_per_10_seconds = _megabytes_per_10_seconds(size_bytes, duration_seconds)
+    except MediaToolError:
+        pass
+    return size_bytes, resolution, mb_per_10_seconds
+
+
+def _add_thumbnail_to_existing_video(
+    root: Path,
+    source_path: Path,
+    tools: ToolPaths,
+    log: LogFn,
+) -> FileResult:
+    size_bytes = 0
+    resolution = None
+    mb_per_10_seconds = None
+    try:
+        size_bytes, resolution, mb_per_10_seconds = _video_file_metrics(source_path, tools)
+        if video_has_attached_thumbnail(source_path, tools):
+            log(f"Skipping MP4 that already has a thumbnail: {_display_path(root, source_path)}")
+            return FileResult(
+                source_path=source_path,
+                media_kind="video",
+                action="skipped",
+                status="ok",
+                detail="MP4 already has an attached thumbnail.",
+                size_bytes=size_bytes,
+                resolution=resolution,
+                mb_per_10_seconds=mb_per_10_seconds,
+                reduced_size_bytes=size_bytes,
+                reduced_resolution=resolution,
+                reduced_mb_per_10_seconds=mb_per_10_seconds,
+            )
+
+        with tempfile.TemporaryDirectory(prefix="second-cut-standalone-thumbnail-") as temp_dir:
+            candidate_path = Path(temp_dir) / source_path.name
+            log(f"Adding video thumbnail: {_display_path(root, source_path)}")
+            thumbnail_resolution = add_video_thumbnail(source_path, candidate_path, tools)
+            candidate_size = file_size(candidate_path)
+
+            archive_path = _archive_path(root, ORIGINALS_DIR_NAME, source_path.relative_to(root))
+            log(
+                "Archiving video before adding thumbnail: "
+                f"{_display_path(root, source_path)} -> {_display_path(root, archive_path)}"
+            )
+            _move_to_destination(source_path, archive_path)
+            try:
+                _move_to_destination(candidate_path, source_path)
+            except Exception:
+                if not source_path.exists() and archive_path.exists():
+                    _move_to_destination(archive_path, source_path)
+                raise
+
+        return FileResult(
+            source_path=source_path,
+            media_kind="video",
+            action="thumbnailed",
+            status="ok",
+            detail=(
+                "Added an attached thumbnail "
+                f"({thumbnail_resolution[0]} x {thumbnail_resolution[1]}) and archived the prior MP4."
+            ),
+            archive_count=1,
+            size_bytes=size_bytes,
+            resolution=resolution,
+            mb_per_10_seconds=mb_per_10_seconds,
+            reduced_size_bytes=candidate_size,
+            reduced_resolution=resolution,
+            reduced_mb_per_10_seconds=mb_per_10_seconds,
+            thumbnail_added=True,
+        )
+    except (MediaToolError, OSError, ValueError) as exc:
+        return FileResult(
+            source_path=source_path,
+            media_kind="video",
+            action="failed",
+            status="error",
+            detail=f"Video thumbnail generation failed: {exc}",
+            size_bytes=size_bytes,
+            resolution=resolution,
+            mb_per_10_seconds=mb_per_10_seconds,
+            reduced_size_bytes=size_bytes,
+            reduced_resolution=resolution,
+            reduced_mb_per_10_seconds=mb_per_10_seconds,
+        )
+
+
 def _process_item(root: Path, item: ScanItem, tools: ToolPaths, settings: AppSettings, log: LogFn) -> FileResult:
     source_path = item.source_path
     if not source_path.exists():
@@ -898,7 +1087,39 @@ def _process_item(root: Path, item: ScanItem, tools: ToolPaths, settings: AppSet
                 reduced_resolution=item.resolution,
                 reduced_mb_per_10_seconds=item.mb_per_10_seconds,
             )
-        return _finalize_video(root, item, candidate_path, encoder, log)
+
+        candidate_has_thumbnail = False
+        if settings.add_video_thumbnails:
+            thumbnail_candidate_path = temp_root / f"{source_path.stem}.thumbnail.mp4"
+            log(f"Adding thumbnail to compacted video: {_display_path(root, source_path)}")
+            try:
+                add_video_thumbnail(candidate_path, thumbnail_candidate_path, tools)
+            except (MediaToolError, OSError, ValueError) as exc:
+                return FileResult(
+                    source_path=source_path,
+                    media_kind=item.media_kind,
+                    action="failed",
+                    status="error",
+                    detail=f"Video compacted, but thumbnail generation failed: {exc}",
+                    archive_count=0,
+                    size_bytes=item.size_bytes,
+                    resolution=item.resolution,
+                    mb_per_10_seconds=item.mb_per_10_seconds,
+                    reduced_size_bytes=item.size_bytes,
+                    reduced_resolution=item.resolution,
+                    reduced_mb_per_10_seconds=item.mb_per_10_seconds,
+                )
+            candidate_path = thumbnail_candidate_path
+            candidate_has_thumbnail = True
+
+        return _finalize_video(
+            root,
+            item,
+            candidate_path,
+            encoder,
+            log,
+            candidate_has_thumbnail=candidate_has_thumbnail,
+        )
 
 
 def _finalize_image(root: Path, item: ScanItem, candidate_path: Path, log: LogFn) -> FileResult:
@@ -962,6 +1183,8 @@ def _finalize_video(
     candidate_path: Path,
     encoder: str,
     log: LogFn,
+    *,
+    candidate_has_thumbnail: bool = False,
 ) -> FileResult:
     source_path = item.source_path
     final_path = source_path if source_path.suffix.lower() == ".mp4" else source_path.with_suffix(".mp4")
@@ -1027,12 +1250,13 @@ def _finalize_video(
     )
     _move_to_destination(source_path, archive_path)
     _move_to_destination(candidate_path, final_path)
+    thumbnail_detail = " and attached a thumbnail" if candidate_has_thumbnail else ""
     return FileResult(
         source_path=final_path,
         media_kind="video",
         action="shrunk",
         status="ok",
-        detail=f"Replaced video with a smaller MP4 and archived the original ({encoder}).",
+        detail=f"Replaced video with a smaller MP4{thumbnail_detail} and archived the original ({encoder}).",
         archive_count=1,
         size_bytes=item.size_bytes,
         resolution=item.resolution,
@@ -1040,6 +1264,7 @@ def _finalize_video(
         reduced_size_bytes=candidate_size,
         reduced_resolution=reduced_resolution,
         reduced_mb_per_10_seconds=reduced_mb_per_10_seconds,
+        thumbnail_added=candidate_has_thumbnail,
     )
 
 

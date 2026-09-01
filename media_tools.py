@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -142,7 +144,7 @@ def probe_media_resolution(source: Path, tools: ToolPaths) -> tuple[int, int]:
             "-v",
             "error",
             "-select_streams",
-            "v:0",
+            "V:0",
             "-show_entries",
             "stream=width,height",
             "-of",
@@ -163,6 +165,122 @@ def probe_media_resolution(source: Path, tools: ToolPaths) -> tuple[int, int]:
     return width, height
 
 
+def video_has_attached_thumbnail(source: Path, tools: ToolPaths) -> bool:
+    output = _run_capture(
+        [
+            tools.ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v",
+            "-show_entries",
+            "stream_disposition=attached_pic",
+            "-of",
+            "json",
+            str(source),
+        ]
+    )
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise MediaToolError(f"Could not inspect video thumbnails for {source.name}.") from exc
+
+    return any(
+        stream.get("disposition", {}).get("attached_pic") == 1
+        for stream in payload.get("streams", [])
+    )
+
+
+def _probe_video_stream_count(source: Path, tools: ToolPaths) -> int:
+    output = _run_capture(
+        [
+            tools.ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+            str(source),
+        ]
+    )
+    stream_count = len([line for line in output.splitlines() if line.strip()])
+    if stream_count == 0:
+        raise MediaToolError(f"No video stream found in {source.name}.")
+    return stream_count
+
+
+def add_video_thumbnail(source: Path, candidate: Path, tools: ToolPaths) -> tuple[int, int]:
+    """Write an MP4 copy with a generated attached-picture stream.
+
+    The caller supplies a distinct destination and decides when to promote it. All
+    intermediate image and mux files live in an automatically cleaned temp folder.
+    """
+    if source.resolve() == candidate.resolve():
+        raise ValueError("The thumbnail output must be different from the source video.")
+    if candidate.exists():
+        raise ValueError(f"Thumbnail output already exists: {candidate}")
+
+    width, height = probe_media_resolution(source, tools)
+    thumbnail_width = max(1, width // 10)
+    thumbnail_height = max(1, height // 10)
+    video_stream_count = _probe_video_stream_count(source, tools)
+
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="second-cut-thumbnail-") as temp_dir:
+        temp_root = Path(temp_dir)
+        thumbnail_path = temp_root / "thumbnail.png"
+        muxed_path = temp_root / "with-thumbnail.mp4"
+
+        _run(
+            [
+                tools.ffmpeg,
+                "-y",
+                "-i",
+                str(source),
+                "-map",
+                "0:V:0",
+                "-vf",
+                f"thumbnail=300,scale={thumbnail_width}:{thumbnail_height}",
+                "-frames:v",
+                "1",
+                str(thumbnail_path),
+            ]
+        )
+        _run(
+            [
+                tools.ffmpeg,
+                "-y",
+                "-i",
+                str(source),
+                "-i",
+                str(thumbnail_path),
+                "-map",
+                "0",
+                "-map",
+                "1:v:0",
+                "-map_metadata",
+                "0",
+                "-c",
+                "copy",
+                f"-c:v:{video_stream_count}",
+                "png",
+                f"-disposition:v:{video_stream_count}",
+                "attached_pic",
+                f"-metadata:s:v:{video_stream_count}",
+                "title=Cover",
+                f"-metadata:s:v:{video_stream_count}",
+                "comment=Cover (front)",
+                str(muxed_path),
+            ]
+        )
+        shutil.move(str(muxed_path), str(candidate))
+
+    return thumbnail_width, thumbnail_height
+
+
 def transcode_video(source: Path, candidate: Path, tools: ToolPaths, preset: str, quality: int) -> str:
     qsv_command = [
         tools.ffmpeg,
@@ -174,7 +292,7 @@ def transcode_video(source: Path, candidate: Path, tools: ToolPaths, preset: str
         "-map_metadata",
         "0",
         "-map",
-        "0:v:0",
+        "0:V:0",
         "-map",
         "0:a:0?",
         "-c:v",
@@ -206,7 +324,7 @@ def transcode_video(source: Path, candidate: Path, tools: ToolPaths, preset: str
         "-map_metadata",
         "0",
         "-map",
-        "0:v:0",
+        "0:V:0",
         "-map",
         "0:a:0?",
         "-c:v",
